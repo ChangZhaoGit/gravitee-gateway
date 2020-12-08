@@ -31,6 +31,8 @@ import io.vertx.circuitbreaker.CircuitBreakerOptions;
 import io.vertx.core.AsyncResult;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.InitializingBean;
 import org.springframework.beans.factory.annotation.Autowired;
 
@@ -39,6 +41,7 @@ import org.springframework.beans.factory.annotation.Autowired;
  * @author GraviteeSource Team
  */
 public class FailoverInvoker extends EndpointInvoker implements InitializingBean {
+    private static final Logger LOGGER = LoggerFactory.getLogger(FailoverInvoker.class);
 
     @Autowired
     private Vertx vertx;
@@ -55,13 +58,37 @@ public class FailoverInvoker extends EndpointInvoker implements InitializingBean
     public void invoke(ExecutionContext context, ReadStream<Buffer> stream, Handler<ProxyConnection> connectionHandler) {
         ((MutableExecutionContext)context).request(new FailoverRequest(context.request()));
 
+        final String apiId = (String) context.getAttribute(ExecutionContext.ATTR_API);
         circuitBreaker.execute(new io.vertx.core.Handler<Future<ProxyConnection>>() {
             @Override
             public void handle(Future<ProxyConnection> event) {
                 FailoverInvoker.super.invoke(context, stream, proxyConnection -> {
-                    proxyConnection.exceptionHandler(event::fail);
-                    proxyConnection.responseHandler(response ->
-                            event.complete(new FailoverProxyConnection(proxyConnection, response)));
+                    proxyConnection.exceptionHandler(error -> {
+                        try {
+                            event.fail(error);
+                        } catch (IllegalStateException e) {
+                            if (event.failed()) {
+                                LOGGER.error("Call on API '{}' failed with error '{}', but result already completed due to failure caused by : {}",
+                                        apiId, error.getMessage(), event.cause() == null ? null : event.cause().getMessage(), event.cause());
+                            } else {
+                                LOGGER.error("Call on API '{}' failed with error '{}', but result already completed", apiId, error.getMessage());
+                            }
+                            throw e; // rethrow the exception to let vertx handle this case
+                        }
+                    });
+                    proxyConnection.responseHandler(response -> {
+                        try {
+                            event.complete(new FailoverProxyConnection(proxyConnection, response));
+                        } catch (IllegalStateException e) {
+                            if (event.failed()) {
+                                LOGGER.error("Call on API '{}' succeeded but result already completed due to failure caused by : {}",
+                                        apiId, event.cause() == null ? null : event.cause().getMessage(), event.cause());
+                            } else {
+                                LOGGER.error("Call on API '{}' succeeded but result already completed", apiId);
+                            }
+                            throw e; // rethrow the exception to let vertx handle this case
+                        }
+                    });
                 });
             }
         }).setHandler(new io.vertx.core.Handler<AsyncResult<ProxyConnection>>() {
